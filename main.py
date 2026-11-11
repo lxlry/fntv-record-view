@@ -32,6 +32,24 @@ ACTIVITY_TMP_PATH = os.path.join(BASE_DIR, 'trimactivity_tmp.db')
 DB_EXPIRATION_SECONDS = 60  # 数据库副本的过期时间（60秒）
 _last_copy_time = 0.0       # 上次拷贝成功的时间戳，初始化为0以强制首次拷贝
 _db_copy_lock = threading.Lock() # 确保只有一个线程执行拷贝操作
+_copy_ready = threading.Event()
+_online_ready = threading.Event()
+_background_lock = threading.Lock()
+_background_started = False
+_diff_cv = threading.Condition()
+_diff = {
+    "db": None,
+    "online": None,
+    "extras": [],
+    "orphans": [],
+    "building": False,
+}
+_result_lock = threading.Lock()
+_result_cache = {}
+_result_waiters = {}
+_merge_lock = threading.Lock()
+_RESULT_TTL = 120
+_RESULT_MAX = 8
 
 def _sqlite_ro_uri(path):
     """只读 URI。Windows 路径里的反斜杠不能直接放进 file: URI。"""
@@ -102,56 +120,197 @@ def _atomic_copy_database():
             wal = "，含 wal" if os.path.isfile(ACTIVITY_TMP_PATH + "-wal") else ""
             logger.info(f"登录会话库拷贝成功: {ACTIVITY_SRC_PATH} -> {ACTIVITY_TMP_PATH}{wal}")
 
+
+def _index_copy():
+    """索引只建在容器里的副本上，方便按账号和时间取出当前页。"""
+    if not os.path.isfile(TMP_DB_PATH):
+        return
+    logger.info("开始为数据库副本添加查询索引")
+    conn = sqlite3.connect(TMP_DB_PATH, timeout=30)
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_play_visible_user_time "
+            "ON item_user_play(visible, user_guid, update_time)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_item_parent_guid ON item(parent_guid)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("数据库副本索引已就绪")
+
+
+def _clear_result_cache():
+    with _result_lock:
+        _result_cache.clear()
+
+
+def _open_ro():
+    last_error = None
+    for attempt in range(3):
+        try:
+            conn = sqlite3.connect(
+                _sqlite_ro_uri(TMP_DB_PATH), uri=True, timeout=30, check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            logger.warning("打开数据库副本失败，准备重试: %s", exc)
+            time.sleep(0.05 * (attempt + 1))
+    logger.error("多次重试后数据库仍然被锁定。")
+    raise last_error
+
+
+def _copy_once():
+    """后台拷贝。请求只读已经落盘的那一份，不在这里等待整库拷贝。"""
+    copied = False
+    with _db_copy_lock:
+        previous = _last_copy_time
+        _atomic_copy_database()
+        copied = _last_copy_time != previous and os.path.isfile(TMP_DB_PATH)
+        if copied:
+            try:
+                _index_copy()
+            except Exception:
+                logger.exception("给数据库副本建索引失败")
+    _copy_ready.set()
+    if copied:
+        _clear_result_cache()
+        try:
+            _rebuild_diff()
+        except Exception:
+            logger.exception("拷贝后更新在线差集失败")
+
+
+def _copy_loop():
+    while True:
+        try:
+            _copy_once()
+        except Exception:
+            logger.exception("后台拷贝数据库失败")
+            _copy_ready.set()
+        time.sleep(DB_EXPIRATION_SECONDS)
+
+
+def _online_loop():
+    while True:
+        try:
+            _copy_ready.wait()
+            online_history.refresh(_activity_db_path())
+            _rebuild_diff()
+        except Exception:
+            logger.exception("后台刷新在线片库失败")
+        finally:
+            _online_ready.set()
+        interval = float(os.environ.get("ONLINE_CACHE_SECONDS", "30") or 30)
+        time.sleep(max(5.0, interval))
+
+
+def _ensure_background():
+    global _background_started
+    with _background_lock:
+        if _background_started:
+            return
+        _background_started = True
+        threading.Thread(target=_copy_loop, name="db-copy", daemon=True).start()
+        threading.Thread(target=_online_loop, name="online-refresh", daemon=True).start()
+        logger.info("后台任务已启动: 数据库副本和在线片库都不再堵在搜索请求上")
+
+
 @contextmanager
 def get_db_connection() -> Iterator[sqlite3.Connection]:
-    """
-    ### CHANGED: Implemented lazy loading with expiration and thread safety ###
-    
-    为每个请求创建一个新的只读数据库连接。
-    在连接前，会检查临时数据库是否已过期或不存在。如果需要，会触发一次
-    线程安全的、原子化的数据库拷贝。
-    """
-    
-    # 检查数据库副本是否过期或不存在
-    is_expired = (time.time() - _last_copy_time) > DB_EXPIRATION_SECONDS
-    if not os.path.exists(TMP_DB_PATH) or is_expired:
-        # 使用锁来防止多个请求同时触发拷贝 (Race Condition)
-        with _db_copy_lock:
-            # 双重检查：在获取锁后，再次检查是否需要拷贝
-            # 因为可能在等待锁的时候，已经有另一个线程完成了拷贝
-            is_still_expired = (time.time() - _last_copy_time) > DB_EXPIRATION_SECONDS
-            if not os.path.exists(TMP_DB_PATH) or is_still_expired:
-                if is_still_expired:
-                    logger.info("数据库副本已过期，触发更新。")
-                else:
-                    logger.info("数据库副本不存在，触发更新。")
-                _atomic_copy_database()
-
-    # --- 以下为原始的连接逻辑 ---
-    conn = None
-    max_retries = 10
-    base_delay = 0.05  # 50毫秒
-
-    for attempt in range(max_retries):
-        try:
-            conn = sqlite3.connect(_sqlite_ro_uri(TMP_DB_PATH), uri=True, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            break
-        except sqlite3.OperationalError:
-            if attempt < max_retries - 1:
-                time.sleep(base_delay)
-            else:
-                logger.error("多次重试后数据库仍然被锁定。")
-                raise
-    
-    if not conn:
-        raise sqlite3.OperationalError("无法建立数据库连接。")
-
+    """打开已经拷好的只读副本。过期重拷在后台进行。"""
+    _ensure_background()
+    if not os.path.isfile(TMP_DB_PATH):
+        _copy_ready.wait(timeout=120)
+    if not os.path.isfile(TMP_DB_PATH):
+        raise sqlite3.OperationalError("数据库副本还不存在")
+    conn = _open_ro()
     try:
         yield conn
     finally:
-        if conn:
-            conn.close()
+        conn.close()
+
+
+def _compute_diff():
+    """算出两类在线记录：接口里多出来的，以及播放表里对不上本地片子的。"""
+    conn = _open_ro()
+    try:
+        taken = {
+            (row['user_guid'], row['item_guid'])
+            for row in conn.execute(
+                'SELECT user_guid, item_guid FROM item_user_play WHERE visible = 1'
+            )
+        }
+        names = {
+            row['guid']: row['username']
+            for row in conn.execute('SELECT guid, username FROM user')
+        }
+        orphan_rows = conn.execute('''
+            SELECT
+                iup.item_guid,
+                iup.user_guid,
+                iup.ts as position,
+                iup.watched,
+                iup.create_time,
+                iup.update_time,
+                iup.resolution,
+                u.username
+            FROM item_user_play iup
+            JOIN user u ON iup.user_guid = u.guid
+            LEFT JOIN item i ON iup.item_guid = i.guid
+            WHERE iup.visible = 1 AND i.guid IS NULL
+        ''').fetchall()
+        orphans = [_orphan_entry(row) for row in orphan_rows]
+    finally:
+        conn.close()
+    extras = []
+    for record in online_history.records():
+        if (record['user_guid'], record['item_guid']) in taken:
+            continue
+        record = dict(record)
+        record['username'] = names.get(record['user_guid']) or '未识别账号'
+        extras.append(record)
+    logger.info(
+        "在线差集已更新: 继续观看多出 %s 条, 播放表里没有片子的 %s 条",
+        len(extras), len(orphans),
+    )
+    return extras, orphans
+
+
+def _rebuild_diff():
+    """副本或在线缓存变了才重算。同一次只算一遍，搜索和统计共用结果。"""
+    if not os.path.isfile(TMP_DB_PATH):
+        return
+    while True:
+        db_token = _last_copy_time
+        online_token = online_history.generation()
+        with _diff_cv:
+            if _diff["db"] == db_token and _diff["online"] == online_token:
+                return
+            if _diff["building"]:
+                _diff_cv.wait(timeout=30)
+                continue
+            _diff["building"] = True
+        try:
+            extras, orphans = _compute_diff()
+        except Exception:
+            with _diff_cv:
+                _diff["building"] = False
+                _diff_cv.notify_all()
+            raise
+        with _diff_cv:
+            _diff["building"] = False
+            if _last_copy_time == db_token and online_history.generation() == online_token:
+                _diff["db"] = db_token
+                _diff["online"] = online_token
+                _diff["extras"] = extras
+                _diff["orphans"] = orphans
+                _diff_cv.notify_all()
+                return
+            _diff_cv.notify_all()
 
 # ===============================================================
 # Flask 应用 (Flask Application)
@@ -234,37 +393,29 @@ def _activity_db_path():
         return ACTIVITY_TMP_PATH
     return None
 
-def _refresh_online():
-    try:
-        online_history.refresh(_activity_db_path())
-    except Exception as exc:
-        logger.error(f"加载在线片库播放记录失败: {exc}")
+def _online_snapshot():
+    """读后台算好的在线差集。第一次还没算完时最多等一轮刷新。"""
+    _ensure_background()
+    if not _online_ready.is_set():
+        _online_ready.wait(timeout=20)
+    _rebuild_diff()
+    with _diff_cv:
+        return list(_diff["extras"]), list(_diff["orphans"])
 
-def _online_extras(conn):
+
+def _online_extras(conn=None):
     """在线片库里、本地 item_user_play 还没有的记录。"""
-    _refresh_online()
-    taken = {
-        (row['user_guid'], row['item_guid'])
-        for row in conn.execute(
-            'SELECT user_guid, item_guid FROM item_user_play WHERE visible = 1'
-        )
-    }
-    names = {
-        row['guid']: row['username']
-        for row in conn.execute('SELECT guid, username FROM user')
-    }
-    extras = []
-    for record in online_history.records():
-        if (record['user_guid'], record['item_guid']) in taken:
-            continue
-        record = dict(record)
-        record['username'] = names.get(record['user_guid']) or '未识别账号'
-        extras.append(record)
-    logger.info(
-        "继续观看 %s 条，其中 %s 条不在本地播放表，会按在线片库显示",
-        len(online_history.records()), len(extras),
-    )
+    extras, _orphans = _online_snapshot()
     return extras
+
+
+def _filtered_online(user_guid, search_title, start_ms, end_ms):
+    extras, orphans = _online_snapshot()
+    matched = []
+    for entry in orphans + extras:
+        if _online_matches(entry, user_guid, search_title, start_ms, end_ms):
+            matched.append(entry)
+    return matched
 
 def _online_matches(record, user_guid, search_title, start_ms, end_ms):
     if user_guid and record.get('user_guid') != user_guid:
@@ -454,120 +605,208 @@ _HISTORY_COLUMNS = '''
     i.release_date
 '''
 
+def _result_key(user_guid, search_title, start_ms, end_ms):
+    return (
+        user_guid or "",
+        (search_title or "").strip().lower(),
+        start_ms,
+        end_ms,
+    )
+
+
+def _cache_fresh(cached):
+    return bool(
+        cached
+        and time.time() - cached["at"] < _RESULT_TTL
+        and cached["db"] == _last_copy_time
+        and cached["online"] == online_history.generation()
+    )
+
+
+def _build_merged(conn, user_guid, search_title, start_ms, end_ms):
+    """同一组筛选只合并一次。这里只保留排序用的键，卡片内容留到当前页再查。"""
+    where_clause = "WHERE iup.visible = 1"
+    params = []
+    if user_guid:
+        where_clause += " AND iup.user_guid = ?"
+        params.append(user_guid)
+    if search_title:
+        logger.info("搜索关键词: %s", search_title)
+        where_clause += """
+            AND i.guid IN (
+                WITH RECURSIVE matched(guid, depth) AS (
+                    SELECT guid, 0 FROM item
+                    WHERE title LIKE ? OR original_title LIKE ?
+                    UNION ALL
+                    SELECT child.guid, parent.depth + 1
+                    FROM item child
+                    INNER JOIN matched parent ON child.parent_guid = parent.guid
+                    WHERE parent.depth < 10
+                )
+                SELECT guid FROM matched
+            )
+        """
+        search_param = f"%{search_title}%"
+        params.extend([search_param, search_param])
+    if start_ms is not None:
+        where_clause += " AND iup.update_time >= ?"
+        params.append(start_ms)
+    if end_ms is not None:
+        where_clause += " AND iup.update_time <= ?"
+        params.append(end_ms)
+
+    local_rows = conn.execute(f'''
+        SELECT iup.item_guid, iup.user_guid, iup.update_time
+        FROM item_user_play iup
+        JOIN user u ON iup.user_guid = u.guid
+        JOIN item i ON iup.item_guid = i.guid
+        {where_clause}
+    ''', params).fetchall()
+    merged = [
+        ("local", row["update_time"] or 0, row["item_guid"], row["user_guid"])
+        for row in local_rows
+    ]
+    for entry in _filtered_online(user_guid, search_title, start_ms, end_ms):
+        merged.append(("online", entry.get("sort_ts") or 0, entry, ""))
+    merged.sort(key=lambda item: item[1], reverse=True)
+    online_count = sum(1 for kind, _ts, _a, _b in merged if kind == "online")
+    logger.info(
+        "播放记录合并: 本地 %s 条, 在线 %s 条",
+        len(merged) - online_count, online_count,
+    )
+    return merged
+
+
+def _merged_rows(user_guid, search_title, start_ms, end_ms):
+    """同一组条件同时只算一份；翻页和改每页条数直接切这份结果。"""
+    _ensure_background()
+    if not _online_ready.is_set():
+        _online_ready.wait(timeout=20)
+    key = _result_key(user_guid, search_title, start_ms, end_ms)
+    while True:
+        with _result_lock:
+            cached = _result_cache.get(key)
+            if _cache_fresh(cached):
+                return cached["rows"]
+            slot = _result_waiters.get(key)
+            if slot is None:
+                slot = {"event": threading.Event(), "error": None}
+                _result_waiters[key] = slot
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            slot["event"].wait(timeout=60)
+            if slot["error"] is not None:
+                raise slot["error"]
+            continue
+        try:
+            with _merge_lock:
+                with _result_lock:
+                    cached = _result_cache.get(key)
+                    if _cache_fresh(cached):
+                        return cached["rows"]
+                _online_snapshot()
+                db_token = _last_copy_time
+                online_token = online_history.generation()
+                with get_db_connection() as conn:
+                    rows = _build_merged(
+                        conn, user_guid, search_title, start_ms, end_ms
+                    )
+            if _last_copy_time == db_token and online_history.generation() == online_token:
+                with _result_lock:
+                    if len(_result_cache) >= _RESULT_MAX:
+                        oldest = min(
+                            _result_cache, key=lambda item: _result_cache[item]["at"]
+                        )
+                        _result_cache.pop(oldest, None)
+                    _result_cache[key] = {
+                        "at": time.time(),
+                        "rows": rows,
+                        "db": db_token,
+                        "online": online_token,
+                    }
+            return rows
+        except Exception as exc:
+            slot["error"] = exc
+            raise
+        finally:
+            with _result_lock:
+                _result_waiters.pop(key, None)
+            slot["event"].set()
+
+
+def _load_local_page(conn, keys):
+    if not keys:
+        return {}
+    placeholders = ",".join("(?, ?)" for _ in keys)
+    params = [value for pair in keys for value in pair]
+    found = conn.execute(f'''
+        SELECT {_HISTORY_COLUMNS}
+        FROM item_user_play iup
+        JOIN user u ON iup.user_guid = u.guid
+        JOIN item i ON iup.item_guid = i.guid
+        WHERE iup.visible = 1
+          AND (iup.item_guid, iup.user_guid) IN ({placeholders})
+    ''', params).fetchall()
+    return {(row["item_guid"], row["user_guid"]): row for row in found}
+
+
 @app.route('/api/play_history')
 def get_play_history():
     """获取播放历史记录，本地媒体库和在线片库合在一起按时间排序。"""
     user_guid = request.args.get('user_guid', '')
-    page = int(request.args.get('page', 1))
-    per_page = int(request.args.get('per_page', 20))
+    page = max(int(request.args.get('page', 1) or 1), 1)
+    per_page = int(request.args.get('per_page', 20) or 20)
+    if per_page < 1:
+        per_page = 20
+    if per_page > 100:
+        per_page = 100
     search_title = request.args.get('search_title', '').strip()
     start_time = request.args.get('start_time', '')
     end_time = request.args.get('end_time', '')
     start_ms = _parse_filter_time(start_time, '开始时间')
     end_ms = _parse_filter_time(end_time, '结束时间')
 
-    with get_db_connection() as conn:
-        _refresh_online()
-        where_clause = "WHERE iup.visible = 1"
-        params = []
+    merged = _merged_rows(user_guid, search_title, start_ms, end_ms)
+    total = len(merged)
+    offset = (page - 1) * per_page
+    page_rows = merged[offset:offset + per_page]
+    local_keys = [
+        (item_guid, owner)
+        for kind, _ts, item_guid, owner in page_rows
+        if kind == "local"
+    ]
+    history_list = []
+    if local_keys:
+        with get_db_connection() as conn:
+            local_map = _load_local_page(conn, local_keys)
+            hierarchy_cache = {}
+            for kind, _ts, payload, owner in page_rows:
+                if kind == "local":
+                    record = local_map.get((payload, owner))
+                    if record is not None:
+                        history_list.append(format_local_record(conn, record, hierarchy_cache))
+                else:
+                    history_list.append(format_online_record(payload))
+    else:
+        history_list = [
+            format_online_record(payload)
+            for kind, _ts, payload, _owner in page_rows
+            if kind == "online"
+        ]
 
-        if user_guid:
-            where_clause += " AND iup.user_guid = ?"
-            params.append(user_guid)
-
-        if search_title:
-            logger.info(f"搜索关键词: {search_title}")
-            where_clause += """
-                AND i.guid IN (
-                    WITH RECURSIVE matched(guid, depth) AS (
-                        SELECT guid, 0 FROM item
-                        WHERE title LIKE ? OR original_title LIKE ?
-                        UNION ALL
-                        SELECT child.guid, parent.depth + 1
-                        FROM item child
-                        INNER JOIN matched parent ON child.parent_guid = parent.guid
-                        WHERE parent.depth < 10
-                    )
-                    SELECT guid FROM matched
-                )
-            """
-            search_param = f"%{search_title}%"
-            params.extend([search_param, search_param])
-
-        if start_ms is not None:
-            where_clause += " AND iup.update_time >= ?"
-            params.append(start_ms)
-        if end_ms is not None:
-            where_clause += " AND iup.update_time <= ?"
-            params.append(end_ms)
-
-        local_rows = conn.execute(f'''
-            SELECT {_HISTORY_COLUMNS}
-            FROM item_user_play iup
-            JOIN user u ON iup.user_guid = u.guid
-            JOIN item i ON iup.item_guid = i.guid
-            {where_clause}
-        ''', params).fetchall()
-
-        orphan_where = "WHERE iup.visible = 1 AND i.guid IS NULL"
-        orphan_params = []
-        if user_guid:
-            orphan_where += " AND iup.user_guid = ?"
-            orphan_params.append(user_guid)
-        if start_ms is not None:
-            orphan_where += " AND iup.update_time >= ?"
-            orphan_params.append(start_ms)
-        if end_ms is not None:
-            orphan_where += " AND iup.update_time <= ?"
-            orphan_params.append(end_ms)
-        orphan_rows = conn.execute(f'''
-            SELECT
-                iup.item_guid,
-                iup.user_guid,
-                iup.ts as position,
-                iup.watched,
-                iup.create_time,
-                iup.update_time,
-                iup.resolution,
-                u.username
-            FROM item_user_play iup
-            JOIN user u ON iup.user_guid = u.guid
-            LEFT JOIN item i ON iup.item_guid = i.guid
-            {orphan_where}
-        ''', orphan_params).fetchall()
-
-        candidates = [('local', row['update_time'] or 0, row) for row in local_rows]
-        for row in orphan_rows:
-            entry = _orphan_entry(row)
-            if _online_matches(entry, user_guid, search_title, start_ms, end_ms):
-                candidates.append(('online', entry['sort_ts'], entry))
-        for entry in _online_extras(conn):
-            if _online_matches(entry, user_guid, search_title, start_ms, end_ms):
-                candidates.append(('online', entry.get('sort_ts') or 0, entry))
-
-        candidates.sort(key=lambda item: item[1], reverse=True)
-        online_count = sum(1 for kind, _stamp, _payload in candidates if kind == 'online')
-        logger.info(
-            "播放记录合并: 本地 %s 条, 在线 %s 条",
-            len(candidates) - online_count, online_count,
-        )
-        total = len(candidates)
-        offset = (page - 1) * per_page
-        hierarchy_cache = {}
-        history_list = []
-        for kind, _stamp, payload in candidates[offset:offset + per_page]:
-            if kind == 'local':
-                history_list.append(format_local_record(conn, payload, hierarchy_cache))
-            else:
-                history_list.append(format_online_record(payload))
-
-        return jsonify({
-            'total': total,
-            'page': page,
-            'per_page': per_page,
-            'pages': (total + per_page - 1) // per_page if per_page else 0,
-            'data': history_list
-        })
+    logger.info(
+        "播放记录查询: 账号=%s 片名=%s 第%s页 本页%s条 合计%s条",
+        user_guid or "全部", search_title or "-", page, len(history_list), total,
+    )
+    return jsonify({
+        'total': total,
+        'page': page,
+        'per_page': per_page,
+        'pages': (total + per_page - 1) // per_page if per_page else 0,
+        'data': history_list
+    })
 
 @app.route('/api/stats')
 def get_stats():
@@ -687,7 +926,7 @@ if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("访问地址: http://127.0.0.1:5000")
     logger.info("Flask 运行模式: 多线程")
-    
+    _ensure_background()
     logger.info("所有组件已启动，服务运行中...")
     logger.info("=" * 50)
     

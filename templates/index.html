@@ -641,6 +641,20 @@
             box-shadow: 0 4px 12px rgba(66, 153, 225, 0.3);
         }
 
+        .btn-search:disabled,
+        .btn-clear:disabled,
+        #per-page:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .history-container.is-busy .pagination {
+            pointer-events: none;
+            opacity: 0.55;
+        }
+
         .btn-clear {
             background: linear-gradient(45deg, #ed8936, #dd6b20);
             color: white;
@@ -1074,7 +1088,20 @@
 
         let historyAbort = null;
 
-        // 加载播放历史。新的一次搜索会取消上一次，避免点了没反应。
+        function setHistoryBusy(busy) {
+            const container = document.querySelector('.history-container');
+            if (container) {
+                container.classList.toggle('is-busy', busy);
+            }
+            const searchBtn = document.querySelector('.btn-search');
+            const clearBtn = document.querySelector('.btn-clear');
+            const perPage = document.getElementById('per-page');
+            if (searchBtn) searchBtn.disabled = busy;
+            if (clearBtn) clearBtn.disabled = busy;
+            if (perPage) perPage.disabled = busy;
+        }
+
+        // 加载播放历史。新的一次搜索会取消上一次，列表马上显示正在加载。
         function loadHistory(showLoading = true) {
             if (historyAbort) {
                 historyAbort.abort();
@@ -1082,21 +1109,16 @@
             const controller = new AbortController();
             historyAbort = controller;
             isLoading = true;
+            setHistoryBusy(true);
             const historyList = document.getElementById('history-list');
             const historyInfo = document.getElementById('history-info');
-            
-            // 只在需要时显示加载状态（避免搜索时闪烁）
-            if (showLoading) {
-                historyList.innerHTML = `
-                    <div class="loading">
-                        <div class="spinner"></div>
-                        <div>正在加载数据...</div>
-                    </div>
-                `;
-            } else {
-                // 搜索时在右上角显示小的加载指示器
-                historyInfo.innerHTML = `<span style="color: #4299e1;">🔍 搜索中...</span>`;
-            }
+            historyInfo.innerHTML = `<span style="color: #4299e1;">🔍 搜索中...</span>`;
+            historyList.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <div>${showLoading ? '正在加载数据...' : '正在搜索...'}</div>
+                </div>
+            `;
 
             const userGuid = document.getElementById('user-select').value;
             const perPage = document.getElementById('per-page').value;
@@ -1243,6 +1265,7 @@
                     if (historyAbort === controller) {
                         isLoading = false;
                         historyAbort = null;
+                        setHistoryBusy(false);
                     }
                 });
         }
@@ -1294,9 +1317,8 @@
             if (page < 1 || page > totalPages || page === currentPage) return;
             
             currentPage = page;
-            // 滚动到页面顶部
             window.scrollTo(0, 0);
-            loadHistory(false); // 分页切换时不显示完整加载页面
+            loadHistory(false);
         }
 
         // 夜间模式切换

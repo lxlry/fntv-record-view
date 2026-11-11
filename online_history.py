@@ -42,7 +42,7 @@ _DEFAULT_STATE_DIRS = (
 _lock = threading.Lock()
 _load_cv = threading.Condition(_lock)
 _loading = False
-_cache = {"at": 0.0, "records": [], "metas": {}}
+_cache = {"at": 0.0, "records": [], "metas": {}, "generation": 0}
 
 
 def _md5(text: str) -> str:
@@ -663,10 +663,17 @@ def refresh(activity_db: str | None) -> None:
             _cache["records"] = records
             _cache["metas"] = metas
             _cache["at"] = time.time()
+            _cache["generation"] = int(_cache.get("generation") or 0) + 1
     finally:
         with _load_cv:
             _loading = False
             _load_cv.notify_all()
+
+
+def generation() -> int:
+    """缓存每更新一次加一。查询用它判断要不要丢掉已经合并好的结果。"""
+    with _lock:
+        return int(_cache.get("generation") or 0)
 
 
 def records() -> list[dict]:
