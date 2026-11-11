@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory
 import sqlite3
 import os
 import logging
@@ -368,6 +368,11 @@ def _orphan_entry(record):
         'watched': bool(record['watched']),
         'meta': meta,
     }
+
+@app.route('/favicon.ico')
+def favicon():
+    """浏览器标签图标，使用应用图标。"""
+    return send_from_directory(os.path.join(BASE_DIR, 'static'), 'icon.png', mimetype='image/png')
 
 @app.route('/')
 def index():
