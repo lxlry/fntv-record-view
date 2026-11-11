@@ -8,16 +8,16 @@ services:
     volumes:
       # 只读挂载外部数据库目录到容器内的database目录
       - /usr/local/apps/@appdata/trim.media/database:/app/database:ro
-      # 第三方在线源的播放进度和片名缓存。只读，不挂影视自己的 socket。
-      - /usr/local/apps/@appdata/fnmedia-ext/state:/app/online_state:ro
+      # 挂已经存在的目录。只在 trim_media.sock 真是 socket 时才连接，
+      # 不把 socket 文件本身写进挂载，避免它不存在时被 Docker 建成目录。
+      - /var/run:/host/run
+      - /usr/local/apps:/host/apps:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       - FLASK_ENV=production
       - PYTHONPATH=/app
       - TZ=Asia/Shanghai # 设置时区
-      - ONLINE_STATE_DIR=/app/online_state
-      # 只发 HTTP 读继续观看，不挂载 /var/run/trim_media.sock
       - TRIM_MEDIA_URL=http://host.docker.internal:5666
     restart: unless-stopped
     network_mode: bridge

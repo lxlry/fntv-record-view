@@ -208,10 +208,11 @@ def _parse_filter_time(value, label):
         return None
 
 def _activity_db_path():
-    if os.path.isfile(ACTIVITY_TMP_PATH):
-        return ACTIVITY_TMP_PATH
+    # 直接读挂载目录里的库。登录会话可能还在旁边的 wal 里，只拷贝主文件会漏掉。
     if os.path.isfile(ACTIVITY_SRC_PATH):
         return ACTIVITY_SRC_PATH
+    if os.path.isfile(ACTIVITY_TMP_PATH):
+        return ACTIVITY_TMP_PATH
     return None
 
 def _refresh_online():

@@ -4,9 +4,9 @@
 在线片库不进这张 item 表，进度在另外两处：
 
 - 影视服务自己的「继续观看」：GET /v/api/v1/play/list。
-  用 trimactivity.db 里仍有效的登录 token，经 TRIM_MEDIA_URL 发 HTTP 去拉。
-  不连接、不挂载影视的 Unix Socket，避免 Docker 在 socket 路径上建出目录。
-  官方在线片库的云端进度会在这里合并出来。
+  用 trimactivity.db 里仍有效的登录 token 去拉。官方在线片库的进度只在这个接口里。
+  优先连已经存在的 /var/run/trim_media.sock（容器里挂的是整个 /var/run，
+  不会在 socket 路径上建目录）。连不上再按 TRIM_MEDIA_URL 和常见端口走 HTTP。
 - 第三方在线源（如 fnmedia-ext）写在自己的 state/history.json，片名在同目录 titles.json。
 
 两边都只读。读不到时返回空列表，不影响本地记录。
@@ -95,6 +95,15 @@ def state_dirs() -> list[str]:
         if chunk:
             parts.append(chunk)
     parts.extend(_DEFAULT_STATE_DIRS)
+    # 第三方在线源的进度在自己的安装目录，不在影视数据库里。
+    for root in ("/host/apps", "/usr/local/apps"):
+        for rel in (
+            "fnmedia-ext/app/repo/state",
+            "fnmedia-ext/state",
+            "@appdata/fnmedia-ext/state",
+            "@appdata/fnmedia-ext/app/repo/state",
+        ):
+            parts.append(os.path.join(root, rel))
     for path in parts:
         norm = os.path.abspath(path)
         if norm in seen:
@@ -449,30 +458,69 @@ def _socket_request(sock_path: str, token: str) -> dict | None:
     return _decode_http(chunks)
 
 
-def _socket_path() -> str:
-    """只有显式设置 TRIM_MEDIA_SOCK 才走 socket，默认不碰影视的 socket 文件。"""
-    path = (os.environ.get("TRIM_MEDIA_SOCK") or "").strip()
-    if not path:
-        return ""
+def _is_socket(path: str) -> bool:
     try:
-        if stat.S_ISSOCK(os.stat(path).st_mode):
-            return path
+        return bool(path) and stat.S_ISSOCK(os.stat(path).st_mode)
     except OSError:
-        return ""
-    logger.warning("TRIM_MEDIA_SOCK 不是可用的 socket，已跳过: %s", path)
-    return ""
+        return False
+
+
+def _socket_candidates() -> list[str]:
+    """只连接已经存在的 socket，调用方不会创建这个路径。"""
+    found = []
+    explicit = (os.environ.get("TRIM_MEDIA_SOCK") or "").strip()
+    if _is_socket(explicit):
+        found.append(os.path.abspath(explicit))
+    for root in ("/host/run", "/var/run", "/run"):
+        for name in ("trim_media.sock", "mediasrv.socket"):
+            path = os.path.join(root, name)
+            if _is_socket(path) and path not in found:
+                found.append(path)
+    return found
+
+
+def _http_bases() -> list[str]:
+    bases = []
+    explicit = (os.environ.get("TRIM_MEDIA_URL") or "").strip().rstrip("/")
+    if explicit:
+        bases.append(explicit)
+    for extra in (
+        "http://127.0.0.1:5666",
+        "http://host.docker.internal:5666",
+        "http://172.17.0.1:5666",
+    ):
+        if extra not in bases:
+            bases.append(extra)
+    return bases
+
+
+def _accepted(payload, source: str, errors: list[str]) -> list | None:
+    """返回卡片列表。来源不可用时返回 None，并记下原因。"""
+    if not isinstance(payload, dict):
+        errors.append(f"{source} 无响应")
+        return None
+    code = payload.get("code")
+    if code not in (0, None, "0"):
+        errors.append(f"{source} code={code} {payload.get('msg') or ''}".strip())
+        return None
+    return _cards_of(payload)
 
 
 def _play_list(token: str) -> list:
-    sock = _socket_path()
-    payload = _socket_request(sock, token) if sock else None
-    if payload is None:
-        base = (os.environ.get("TRIM_MEDIA_URL") or "").strip().rstrip("/")
-        if base:
-            payload = _http_request(base + _PLAY_LIST_PATH, token)
-    if not payload or payload.get("code") not in (0, None):
-        return []
-    return _cards_of(payload)
+    errors = []
+    for sock in _socket_candidates():
+        cards = _accepted(_socket_request(sock, token), f"socket {sock}", errors)
+        if cards is not None:
+            logger.info("已从 %s 读到继续观看 %s 条", sock, len(cards))
+            return cards
+    for base in _http_bases():
+        cards = _accepted(_http_request(base + _PLAY_LIST_PATH, token), base, errors)
+        if cards is not None:
+            logger.info("已从 %s 读到继续观看 %s 条", base, len(cards))
+            return cards
+    if errors:
+        logger.warning("拉取在线片库继续观看失败: %s", "; ".join(errors[:4]))
+    return []
 
 
 def _tokens(activity_db: str | None) -> list[tuple[str, str]]:
@@ -504,25 +552,33 @@ def _tokens(activity_db: str | None) -> list[tuple[str, str]]:
 
 
 def _load_play_lists(activity_db: str | None, metas: dict, bucket: dict) -> int:
+    tokens = _tokens(activity_db)
+    if not tokens:
+        logger.warning(
+            "没有可用的影视登录会话，在线片库继续观看无法读取 (%s)",
+            activity_db or "缺少 trimactivity.db",
+        )
+        return 0
     count = 0
-    for user_guid, token in _tokens(activity_db):
+    for user_guid, token in tokens:
         for card in _play_list(token):
-            guid = card.get("guid") or ""
+            guid = str(card.get("guid") or card.get("item_guid") or "").strip()
             if not guid:
                 continue
+            position = _as_int(card.get("ts")) or _as_int(card.get("position"))
             meta = _meta_from_card(card)
             previous = metas.get(guid)
             if previous and compose_title(previous) != "在线片库":
                 meta = _prefer(
                     {"meta": previous, "position": 0, "duration": previous.get("duration") or 0,
                      "resolution": previous.get("resolution") or "", "sort_ts": 0},
-                    {"meta": meta, "position": _as_int(card.get("ts")),
+                    {"meta": meta, "position": position,
                      "duration": meta.get("duration") or 0,
                      "resolution": meta.get("resolution") or "", "sort_ts": 1},
                 )["meta"]
             metas[guid] = meta
             row = _record(
-                user_guid, guid, _as_int(card.get("ts")),
+                user_guid, guid, position,
                 meta.get("duration") or 0, _guess_card_time(card),
                 meta.get("resolution") or "", bool(card.get("watched")), meta,
             )

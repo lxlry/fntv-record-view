@@ -11,8 +11,10 @@ services:
       TZ: Asia/Shanghai
       FLASK_ENV: production
       PYTHONPATH: /app
-      ONLINE_STATE_DIR: /app/online_state
       TRIM_MEDIA_URL: http://host.docker.internal:5666
     volumes:
       - /usr/local/apps/@appdata/trim.media/database:/app/database:ro
-      - /usr/local/apps/@appdata/fnmedia-ext/state:/app/online_state:ro
+      # 挂已经存在的目录。只在 trim_media.sock 真是 socket 时才连接，
+      # 不把 socket 文件本身写进挂载，避免它不存在时被 Docker 建成目录。
+      - /var/run:/host/run
+      - /usr/local/apps:/host/apps:ro
