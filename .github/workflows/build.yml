@@ -7,8 +7,6 @@ on:
       - master
       - release
       - develop
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -87,8 +85,16 @@ jobs:
           path: fntv-record-view.fpk
           if-no-files-found: error
 
-      - name: Attach fpk to GitHub Release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: fntv-record-view.fpk
+      - name: Publish fpk to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(grep '^version=' fpk/manifest | cut -d= -f2 | tr -d '[:space:]')"
+          tag="v${version}"
+          notes="本次构建来自提交 ${GITHUB_SHA}。在应用中心手动安装 fntv-record-view.fpk。容器镜像需为公开：https://github.com/${GITHUB_REPOSITORY}/pkgs/container/${GITHUB_REPOSITORY#*/}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --latest --notes "$notes"
+            gh release upload "$tag" fntv-record-view.fpk --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" fntv-record-view.fpk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --latest --notes "$notes"
+          fi
