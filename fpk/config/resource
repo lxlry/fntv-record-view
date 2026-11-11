@@ -1,0 +1,10 @@
+{
+  "docker-project": {
+    "projects": [
+      {
+        "name": "fntv-record-view",
+        "path": "docker"
+      }
+    ]
+  }
+}

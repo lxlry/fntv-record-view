@@ -1,6 +1,8 @@
 # Git
 .git
 .gitignore
+.github
+fpk
 
 # Docker
 Dockerfile

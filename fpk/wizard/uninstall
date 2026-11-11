@@ -1,0 +1,23 @@
+[
+  {
+    "stepTitle": "卸载",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_data_action",
+        "label": "应用数据",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "保留",
+            "value": "keep"
+          },
+          {
+            "label": "删除",
+            "value": "delete"
+          }
+        ]
+      }
+    ]
+  }
+]

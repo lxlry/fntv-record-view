@@ -1199,17 +1199,19 @@
                                     ${item.overview ? `<div style="color: #666; font-size: 0.9rem; margin-top: 5px;">${item.overview.substring(0, 100)}...</div>` : ''}
                                     <div class="item-progress">
                                         <div class="progress-bar">
-                                            <div class="progress-fill" style="width: ${item.watched ? 100 : item.progress}%"></div>
+                                            <div class="progress-fill" style="width: ${item.watched ? 100 : (item.runtime ? item.progress : 0)}%"></div>
                                         </div>
                                         <div class="progress-text">
-                                            ${item.watched ? '已观看完成' : `播放进度: ${item.position_formatted} / ${item.runtime_formatted} (${item.progress}%)`}
+                                            ${item.runtime
+                                                ? (item.watched ? '已观看完成' : `播放进度: ${item.position_formatted} / ${item.runtime_formatted} (${item.progress}%)`)
+                                                : `播放位置: ${item.position_formatted}`}
                                         </div>
                                     </div>
                                 </div>
                                 <div class="item-user">
                                     <div class="user-name">${item.username}</div>
-                                    <div class="play-time">开始: ${item.create_time}</div>
-                                    <div class="play-time">最近: ${item.update_time}</div>
+                                    ${item.create_time ? `<div class="play-time">开始: ${item.create_time}</div>` : ''}
+                                    <div class="play-time">最近: ${item.update_time || '-'}</div>
                                 </div>
                             </div>
                         `;

@@ -1,0 +1,7 @@
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "username": "fntv-record-view",
+  "groupname": "fntv-record-view"
+}

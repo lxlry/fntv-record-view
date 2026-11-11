@@ -1,16 +1,24 @@
 services:
   fntv-record-view:
     container_name: fntv-record-view
-    image: qiaokes/fntv-record-view:latest
+    build: .
+    image: fntv-record-view:local
     ports:
       - "5000:5000"
     volumes:
       # 只读挂载外部数据库目录到容器内的database目录
       - /usr/local/apps/@appdata/trim.media/database:/app/database:ro
+      # 第三方在线源的播放进度和片名缓存。只读，不挂影视自己的 socket。
+      - /usr/local/apps/@appdata/fnmedia-ext/state:/app/online_state:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - FLASK_ENV=production
       - PYTHONPATH=/app
       - TZ=Asia/Shanghai # 设置时区
+      - ONLINE_STATE_DIR=/app/online_state
+      # 只发 HTTP 读继续观看，不挂载 /var/run/trim_media.sock
+      - TRIM_MEDIA_URL=http://host.docker.internal:5666
     restart: unless-stopped
     network_mode: bridge
     deploy:

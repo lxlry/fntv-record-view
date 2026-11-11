@@ -1,0 +1,18 @@
+services:
+  fntv-record-view:
+    image: __FNTV_IMAGE__
+    container_name: fntv-record-view
+    restart: unless-stopped
+    ports:
+      - "${TRIM_SERVICE_PORT}:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TZ: Asia/Shanghai
+      FLASK_ENV: production
+      PYTHONPATH: /app
+      ONLINE_STATE_DIR: /app/online_state
+      TRIM_MEDIA_URL: http://host.docker.internal:5666
+    volumes:
+      - /usr/local/apps/@appdata/trim.media/database:/app/database:ro
+      - /usr/local/apps/@appdata/fnmedia-ext/state:/app/online_state:ro
