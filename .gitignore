@@ -25,6 +25,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+# fnOS 的包清单就叫 manifest，不能被上面这条规则排除
+!fpk/manifest
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
