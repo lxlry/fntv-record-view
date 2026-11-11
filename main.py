@@ -283,7 +283,9 @@ def _compute_diff():
         record['username'] = names.get(record['user_guid']) or '未识别账号'
         key = (record['user_guid'], record['item_guid'])
         if key in local_keys:
-            overlaps.append(record)
+            # 继续观看里也有本地片子。只有卡片本身属于在线片库时才再留一条。
+            if (record.get('meta') or {}).get('from_online'):
+                overlaps.append(record)
             continue
         if key in play_keys:
             continue
