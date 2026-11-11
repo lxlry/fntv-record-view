@@ -478,21 +478,17 @@ def get_play_history():
         if search_title:
             logger.info(f"搜索关键词: {search_title}")
             where_clause += """
-                AND EXISTS (
-                    WITH RECURSIVE item_hierarchy(guid, title, original_title, parent_guid, level) AS (
-                        SELECT guid, title, original_title, parent_guid, 0 as level
-                        FROM item
-                        WHERE guid = i.guid
-
+                AND i.guid IN (
+                    WITH RECURSIVE matched(guid, depth) AS (
+                        SELECT guid, 0 FROM item
+                        WHERE title LIKE ? OR original_title LIKE ?
                         UNION ALL
-
-                        SELECT parent.guid, parent.title, parent.original_title, parent.parent_guid, ih.level + 1
-                        FROM item parent
-                        INNER JOIN item_hierarchy ih ON parent.guid = ih.parent_guid
-                        WHERE ih.level < 10 AND parent.guid IS NOT NULL
+                        SELECT child.guid, parent.depth + 1
+                        FROM item child
+                        INNER JOIN matched parent ON child.parent_guid = parent.guid
+                        WHERE parent.depth < 10
                     )
-                    SELECT 1 FROM item_hierarchy
-                    WHERE title LIKE ? OR original_title LIKE ?
+                    SELECT guid FROM matched
                 )
             """
             search_param = f"%{search_title}%"
@@ -690,9 +686,9 @@ if __name__ == '__main__':
     logger.info("启动飞牛影视观看历史管理系统")
     logger.info("=" * 50)
     logger.info("访问地址: http://127.0.0.1:5000")
-    logger.info("Flask 运行模式: 串行处理 (单线程)")
+    logger.info("Flask 运行模式: 多线程")
     
     logger.info("所有组件已启动，服务运行中...")
     logger.info("=" * 50)
     
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, threaded=True)

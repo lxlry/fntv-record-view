@@ -1072,10 +1072,15 @@
             loadHistory(true); // 清除时显示完整加载页面
         }
 
-        // 加载播放历史
+        let historyAbort = null;
+
+        // 加载播放历史。新的一次搜索会取消上一次，避免点了没反应。
         function loadHistory(showLoading = true) {
-            if (isLoading) return;
-            
+            if (historyAbort) {
+                historyAbort.abort();
+            }
+            const controller = new AbortController();
+            historyAbort = controller;
             isLoading = true;
             const historyList = document.getElementById('history-list');
             const historyInfo = document.getElementById('history-info');
@@ -1136,7 +1141,7 @@
                 params.append('end_time', formattedEnd);
             }
 
-            fetch(`/api/play_history?${params}`)
+            fetch(`/api/play_history?${params}`, { signal: controller.signal })
                 .then(response => response.json())
                 .then(data => {
                     totalPages = data.pages;
@@ -1223,6 +1228,9 @@
                     renderPagination(data.page, data.pages);
                 })
                 .catch(error => {
+                    if (error.name === 'AbortError') {
+                        return;
+                    }
                     console.error('加载播放历史失败:', error);
                     historyList.innerHTML = `
                         <div class="empty-state">
@@ -1232,7 +1240,10 @@
                     `;
                 })
                 .finally(() => {
-                    isLoading = false;
+                    if (historyAbort === controller) {
+                        isLoading = false;
+                        historyAbort = null;
+                    }
                 });
         }
 

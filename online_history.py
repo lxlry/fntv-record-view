@@ -40,6 +40,8 @@ _DEFAULT_STATE_DIRS = (
 )
 
 _lock = threading.Lock()
+_load_cv = threading.Condition(_lock)
+_loading = False
 _cache = {"at": 0.0, "records": [], "metas": {}}
 
 
@@ -641,19 +643,30 @@ def _load(activity_db: str | None) -> tuple[list, dict]:
 
 
 def refresh(activity_db: str | None) -> None:
+    """同一时间只拉一次继续观看。查询期间不占着锁，避免搜索请求互相堵住。"""
     ttl = float(os.environ.get("ONLINE_CACHE_SECONDS", "30") or 30)
-    now = time.time()
-    with _lock:
-        if _cache["at"] and now - _cache["at"] < ttl:
+    global _loading
+    with _load_cv:
+        if _cache["at"] and time.time() - _cache["at"] < ttl:
             return
+        if _loading:
+            _load_cv.wait(timeout=20)
+            return
+        _loading = True
+    try:
         try:
             records, metas = _load(activity_db)
         except Exception as exc:
             logger.error("加载在线片库播放记录失败: %s", exc)
             records, metas = [], {}
-        _cache["records"] = records
-        _cache["metas"] = metas
-        _cache["at"] = now
+        with _load_cv:
+            _cache["records"] = records
+            _cache["metas"] = metas
+            _cache["at"] = time.time()
+    finally:
+        with _load_cv:
+            _loading = False
+            _load_cv.notify_all()
 
 
 def records() -> list[dict]:
