@@ -4,7 +4,7 @@
 在线片库不进这张 item 表，进度在另外两处：
 
 - 影视服务自己的「继续观看」：GET /v/api/v1/play/list。
-  用 trimactivity.db 里仍有效的登录 token 去拉。官方在线片库的进度只在这个接口里。
+  用拷到容器里的 trimactivity.db 副本中的登录 token 去拉。官方在线片库的进度只在这个接口里。
   优先连已经存在的 /var/run/trim_media.sock（容器里挂的是整个 /var/run，
   不会在 socket 路径上建目录）。连不上再按 TRIM_MEDIA_URL 和常见端口走 HTTP。
 - 第三方在线源（如 fnmedia-ext）写在自己的 state/history.json，片名在同目录 titles.json。

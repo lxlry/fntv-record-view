@@ -38,11 +38,19 @@ def _sqlite_ro_uri(path):
     return "file:" + os.path.abspath(path).replace("\\", "/") + "?mode=ro"
 
 
-def _atomic_copy_file(src_path, dst_path):
-    """先拷到临时文件再替换，避免读到写了一半的副本。"""
+def _remove_copy(path):
+    try:
+        if os.path.lexists(path):
+            os.remove(path)
+    except OSError as exc:
+        logger.warning(f"清理副本文件失败 {path}: {exc}")
+
+
+def _atomic_copy_one(src_path, dst_path):
+    """只读源文件的字节，先写入临时文件再替换。不在源目录创建任何文件。"""
     atomic_tmp_path = dst_path + ".new"
     try:
-        if not os.path.exists(src_path):
+        if not os.path.isfile(src_path):
             return False
         if not os.access(src_path, os.R_OK):
             logger.warning(f"数据库文件无法读取: {src_path}")
@@ -52,12 +60,24 @@ def _atomic_copy_file(src_path, dst_path):
         return True
     except Exception as e:
         logger.error(f"数据库拷贝失败 {src_path}: {e}")
-        if os.path.exists(atomic_tmp_path):
-            try:
-                os.remove(atomic_tmp_path)
-            except OSError as rm_err:
-                logger.error(f"清理临时文件 {atomic_tmp_path} 失败: {rm_err}")
+        _remove_copy(atomic_tmp_path)
         return False
+
+
+def _atomic_copy_file(src_path, dst_path):
+    """拷贝数据库。WAL 模式下一并拷贝 -wal，shm 留在副本旁边由 SQLite 重建。"""
+    if not _atomic_copy_one(src_path, dst_path):
+        return False
+    wal_src = src_path + "-wal"
+    wal_dst = dst_path + "-wal"
+    if os.path.isfile(wal_src):
+        if not _atomic_copy_one(wal_src, wal_dst):
+            _remove_copy(wal_dst)
+    else:
+        _remove_copy(wal_dst)
+    # 源目录里的 shm 是影视进程的共享内存，拷走没有意义，也不能在源目录新建。
+    _remove_copy(dst_path + "-shm")
+    return True
 
 
 def _atomic_copy_database():
@@ -77,9 +97,10 @@ def _atomic_copy_database():
     if _atomic_copy_file(SRC_DB_PATH, TMP_DB_PATH):
         _last_copy_time = time.time()
         logger.info(f"数据库原子化拷贝成功: {SRC_DB_PATH} -> {TMP_DB_PATH}")
-    if os.path.exists(ACTIVITY_SRC_PATH):
+    if os.path.isfile(ACTIVITY_SRC_PATH):
         if _atomic_copy_file(ACTIVITY_SRC_PATH, ACTIVITY_TMP_PATH):
-            logger.info(f"登录会话库拷贝成功: {ACTIVITY_SRC_PATH} -> {ACTIVITY_TMP_PATH}")
+            wal = "，含 wal" if os.path.isfile(ACTIVITY_TMP_PATH + "-wal") else ""
+            logger.info(f"登录会话库拷贝成功: {ACTIVITY_SRC_PATH} -> {ACTIVITY_TMP_PATH}{wal}")
 
 @contextmanager
 def get_db_connection() -> Iterator[sqlite3.Connection]:
@@ -208,9 +229,7 @@ def _parse_filter_time(value, label):
         return None
 
 def _activity_db_path():
-    # 直接读挂载目录里的库。登录会话可能还在旁边的 wal 里，只拷贝主文件会漏掉。
-    if os.path.isfile(ACTIVITY_SRC_PATH):
-        return ACTIVITY_SRC_PATH
+    # 只打开容器目录里的副本。打开影视目录里的库会在那边创建 shm。
     if os.path.isfile(ACTIVITY_TMP_PATH):
         return ACTIVITY_TMP_PATH
     return None
