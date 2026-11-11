@@ -41,6 +41,7 @@ _diff = {
     "db": None,
     "online": None,
     "extras": [],
+    "overlaps": [],
     "orphans": [],
     "building": False,
 }
@@ -235,14 +236,23 @@ def get_db_connection() -> Iterator[sqlite3.Connection]:
 
 
 def _compute_diff():
-    """算出两类在线记录：接口里多出来的，以及播放表里对不上本地片子的。"""
+    """在线记录分三份：接口多出来的、和本地片子相同的、播放表里对不上片子的。"""
     conn = _open_ro()
     try:
-        taken = {
+        play_keys = {
             (row['user_guid'], row['item_guid'])
             for row in conn.execute(
                 'SELECT user_guid, item_guid FROM item_user_play WHERE visible = 1'
             )
+        }
+        local_keys = {
+            (row['user_guid'], row['item_guid'])
+            for row in conn.execute('''
+                SELECT iup.user_guid, iup.item_guid
+                FROM item_user_play iup
+                JOIN item i ON iup.item_guid = i.guid
+                WHERE iup.visible = 1
+            ''')
         }
         names = {
             row['guid']: row['username']
@@ -267,17 +277,22 @@ def _compute_diff():
     finally:
         conn.close()
     extras = []
+    overlaps = []
     for record in online_history.records():
-        if (record['user_guid'], record['item_guid']) in taken:
-            continue
         record = dict(record)
         record['username'] = names.get(record['user_guid']) or '未识别账号'
+        key = (record['user_guid'], record['item_guid'])
+        if key in local_keys:
+            overlaps.append(record)
+            continue
+        if key in play_keys:
+            continue
         extras.append(record)
     logger.info(
-        "在线差集已更新: 继续观看多出 %s 条, 播放表里没有片子的 %s 条",
-        len(extras), len(orphans),
+        "在线差集已更新: 继续观看多出 %s 条, 和本地相同 %s 条, 播放表里没有片子的 %s 条",
+        len(extras), len(overlaps), len(orphans),
     )
-    return extras, orphans
+    return extras, overlaps, orphans
 
 
 def _rebuild_diff():
@@ -295,7 +310,7 @@ def _rebuild_diff():
                 continue
             _diff["building"] = True
         try:
-            extras, orphans = _compute_diff()
+            extras, overlaps, orphans = _compute_diff()
         except Exception:
             with _diff_cv:
                 _diff["building"] = False
@@ -307,6 +322,7 @@ def _rebuild_diff():
                 _diff["db"] = db_token
                 _diff["online"] = online_token
                 _diff["extras"] = extras
+                _diff["overlaps"] = overlaps
                 _diff["orphans"] = orphans
                 _diff_cv.notify_all()
                 return
@@ -400,19 +416,19 @@ def _online_snapshot():
         _online_ready.wait(timeout=20)
     _rebuild_diff()
     with _diff_cv:
-        return list(_diff["extras"]), list(_diff["orphans"])
+        return list(_diff["extras"]), list(_diff["overlaps"]), list(_diff["orphans"])
 
 
 def _online_extras(conn=None):
-    """在线片库里、本地 item_user_play 还没有的记录。"""
-    extras, _orphans = _online_snapshot()
+    """在线片库里、本地播放表还没有的记录。统计只补这一份，避免和本地重复计数。"""
+    extras, _overlaps, _orphans = _online_snapshot()
     return extras
 
 
 def _filtered_online(user_guid, search_title, start_ms, end_ms):
-    extras, orphans = _online_snapshot()
+    extras, overlaps, orphans = _online_snapshot()
     matched = []
-    for entry in orphans + extras:
+    for entry in orphans + extras + overlaps:
         if _online_matches(entry, user_guid, search_title, start_ms, end_ms):
             matched.append(entry)
     return matched

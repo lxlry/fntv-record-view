@@ -246,6 +246,9 @@ def _card_from_online(card: dict) -> bool:
         if "/media/online" in text or "/online/" in text:
             return True
     return False
+
+
+def _meta_from_card(card: dict) -> dict:
     title = (card.get("title") or "").strip()
     series = (card.get("tv_title") or "").strip()
     if not series:

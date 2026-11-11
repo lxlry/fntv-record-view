@@ -1,5 +1,5 @@
 appname=fntv-record-view
-version=1.0.4
+version=1.0.5
 display_name=观看历史
 desc=只读查看飞牛影视的本地和在线片库播放记录
 source=thirdparty
