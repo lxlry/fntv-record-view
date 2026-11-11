@@ -219,15 +219,31 @@ def _resolution_of(payload: dict) -> str:
     return ""
 
 
-def _library_label(value: str) -> bool:
-    """媒体库名字（「在线资源」一类）不是剧名。"""
+def online_library_name(value: str) -> bool:
+    """片库名称，用来把在线片库和本地媒体库区分开。"""
     text = (value or "").strip()
-    if not text or text in {"在线资源", "在线片库"}:
+    if text in {"在线资源", "在线片库", "在线影视", "云端片库"}:
         return True
     return text.startswith("🌐")
 
 
-def _meta_from_card(card: dict) -> dict:
+def _library_label(value: str) -> bool:
+    """媒体库名字（「在线资源」一类）不是剧名。"""
+    text = (value or "").strip()
+    if not text or online_library_name(text):
+        return True
+    return False
+
+
+def _card_from_online(card: dict) -> bool:
+    for key in ("ancestor_name", "parent_title", "library_name", "db_name", "media_db_name"):
+        if online_library_name(str(card.get(key) or "")):
+            return True
+    for key in ("play_link", "poster", "backdrop"):
+        text = str(card.get(key) or "")
+        if "/media/online" in text or "/online/" in text:
+            return True
+    return False
     title = (card.get("title") or "").strip()
     series = (card.get("tv_title") or "").strip()
     if not series:
@@ -262,16 +278,28 @@ def _meta_from_card(card: dict) -> dict:
         "release_date": str(card.get("release_date") or ""),
         "duration": duration,
         "resolution": _resolution_of(card),
+        "from_online": _card_from_online(card),
     })
     return meta
 
 
 def _guess_card_time(card: dict) -> int:
-    for key in ("update_time", "watched_ts", "create_time", "played_at", "last_play_time"):
+    for key in (
+        "update_time", "watched_ts", "create_time", "played_at",
+        "last_play_time", "updated_at", "modify_time", "watch_time",
+    ):
         stamp = _coerce_ms(card.get(key))
         if stamp >= 1577836800000:  # 2020-01-01，避开把播放秒数误当成时间
             return stamp
     return 0
+
+
+def _card_sort_ts(card: dict, index: int) -> int:
+    """继续观看接口按最近播放排列。没有时间字段时保留这个顺序，避免沉到列表末尾。"""
+    stamp = _guess_card_time(card)
+    if stamp:
+        return stamp
+    return int(time.time() * 1000) - index
 
 
 def _record(user_guid: str, item_guid: str, position: int, duration: int,
@@ -561,13 +589,16 @@ def _load_play_lists(activity_db: str | None, metas: dict, bucket: dict) -> int:
         return 0
     count = 0
     for user_guid, token in tokens:
-        for card in _play_list(token):
+        cards = _play_list(token)
+        for index, card in enumerate(cards):
             guid = str(card.get("guid") or card.get("item_guid") or "").strip()
             if not guid:
                 continue
             position = _as_int(card.get("ts")) or _as_int(card.get("position"))
             meta = _meta_from_card(card)
             previous = metas.get(guid)
+            if previous and previous.get("from_online"):
+                meta["from_online"] = True
             if previous and compose_title(previous) != "在线片库":
                 meta = _prefer(
                     {"meta": previous, "position": 0, "duration": previous.get("duration") or 0,
@@ -579,7 +610,7 @@ def _load_play_lists(activity_db: str | None, metas: dict, bucket: dict) -> int:
             metas[guid] = meta
             row = _record(
                 user_guid, guid, position,
-                meta.get("duration") or 0, _guess_card_time(card),
+                meta.get("duration") or 0, _card_sort_ts(card, index),
                 meta.get("resolution") or "", bool(card.get("watched")), meta,
             )
             key = (user_guid, guid)

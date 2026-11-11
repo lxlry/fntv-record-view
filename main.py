@@ -260,6 +260,10 @@ def _online_extras(conn):
         record = dict(record)
         record['username'] = names.get(record['user_guid']) or '未识别账号'
         extras.append(record)
+    logger.info(
+        "继续观看 %s 条，其中 %s 条不在本地播放表，会按在线片库显示",
+        len(online_history.records()), len(extras),
+    )
     return extras
 
 def _online_matches(record, user_guid, search_title, start_ms, end_ms):
@@ -304,6 +308,14 @@ def format_local_record(conn, record, cache):
         progress = min(100, (record['position'] / runtime_seconds) * 100)
 
     is_episode = record['season_number'] is not None and record['episode_number'] is not None
+    play_type = record['play_type']
+    source = 'local'
+    online_meta = online_history.meta_for(record['item_guid']) or {}
+    if online_meta.get("from_online") or any(
+        online_history.online_library_name(item['title']) for item in hierarchy
+    ):
+        play_type = '在线片库'
+        source = 'online'
     return {
         'item_guid': record['item_guid'],
         'user_guid': record['user_guid'],
@@ -312,8 +324,8 @@ def format_local_record(conn, record, cache):
         'original_title': record['original_title'],
         'overview': record['overview'],
         'type': record['item_type'],
-        'play_type': record['play_type'],
-        'source': 'local',
+        'play_type': play_type,
+        'source': source,
         'season_number': record['season_number'],
         'episode_number': record['episode_number'],
         'series_title': series_info,
@@ -538,6 +550,11 @@ def get_play_history():
                 candidates.append(('online', entry.get('sort_ts') or 0, entry))
 
         candidates.sort(key=lambda item: item[1], reverse=True)
+        online_count = sum(1 for kind, _stamp, _payload in candidates if kind == 'online')
+        logger.info(
+            "播放记录合并: 本地 %s 条, 在线 %s 条",
+            len(candidates) - online_count, online_count,
+        )
         total = len(candidates)
         offset = (page - 1) * per_page
         hierarchy_cache = {}
